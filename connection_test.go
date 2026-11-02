@@ -45,10 +45,10 @@ func TestParsePath(t *testing.T) {
 			shouldError: false,
 		},
 		{
-			name:        "path traversal attempt",
+			name:        "virtual root parent normalization",
 			input:       "../../../etc/passwd",
 			wantRemote:  "/etc/passwd", // path.Clean will normalize it
-			shouldError: false,         // It's handled by security check, not error
+			shouldError: false,         // Virtual parent traversal stays at FTP root
 		},
 	}
 
@@ -72,11 +72,12 @@ func TestParsePath(t *testing.T) {
 				t.Errorf("Expected remote '%s', got '%s'", tt.wantRemote, remote)
 			}
 
-			// Verify local path is within homeDir
-			absHome, _ := filepath.Abs(tmpDir)
-			absLocal, _ := filepath.Abs(local)
-			if absLocal[:len(absHome)] != absHome {
-				t.Errorf("Local path '%s' escapes home directory '%s'", absLocal, absHome)
+			expectedLocal := filepath.FromSlash(tt.wantRemote[1:])
+			if expectedLocal == "" {
+				expectedLocal = "."
+			}
+			if local != expectedLocal {
+				t.Errorf("Expected root-relative path %q, got %q", expectedLocal, local)
 			}
 		})
 	}
@@ -125,15 +126,8 @@ func TestPathTraversalSecurity(t *testing.T) {
 		t.Run(attempt, func(t *testing.T) {
 			_, local, err := conn.parsePath(attempt)
 
-			// Should either error or stay within home directory
-			if err == nil {
-				absHome, _ := filepath.Abs(tmpDir)
-				absLocal, _ := filepath.Abs(local)
-
-				// Path must start with home directory
-				if len(absLocal) < len(absHome) || absLocal[:len(absHome)] != absHome {
-					t.Errorf("Path traversal succeeded! Path '%s' escapes home '%s'", absLocal, absHome)
-				}
+			if err == nil && !filepath.IsLocal(local) {
+				t.Errorf("Non-local filesystem path returned: %q", local)
 			}
 		})
 	}
@@ -143,9 +137,9 @@ func TestParseCommand(t *testing.T) {
 	conn := &FTPConn{}
 
 	tests := []struct {
-		input    string
-		wantCmd  string
-		wantArg  string
+		input   string
+		wantCmd string
+		wantArg string
 	}{
 		{"USER test", "USER", "test"},
 		{"PASS", "PASS", ""},

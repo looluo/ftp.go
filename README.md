@@ -26,7 +26,7 @@ A simple FTP server implementation in Go.
 
 ## Requirements
 
-- Go 1.16 or later
+- Go 1.25 or later (uses `os.Root`, including `MkdirAll` and `Rename`)
 
 ## Configuration
 
@@ -74,6 +74,7 @@ go build -o ftp-server .
 
 ```bash
 go test ./... -v
+go test -race ./...
 ```
 
 ### Integration Testing
@@ -98,7 +99,11 @@ The server is organized into the following components:
 ## Security Notes
 
 - Passwords are transmitted in plaintext (FTP protocol limitation). Use FTPS/FTPS for secure transmission.
-- Path traversal attacks are mitigated by validating all file paths against the user's home directory.
+- Each successful login opens an `os.Root` handle. All FTP filesystem commands operate relative to that handle, including directory listing metadata and both rename paths. This prevents traversal through external symlinks, including symlink replacement races, on supported native platforms.
+- FTP paths use `/`. Parent components are normalized within the virtual root; backslashes, colons (including Windows drive/alternate-stream syntax), and NUL are rejected. Relative symlinks that stay inside the root work; absolute symlinks are rejected, including absolute links back into the root.
+- `PORT` requires six decimal octets in 0–255, the control peer's IP, and a port in 1024–65535. Invalid requests preserve the previous data endpoint. The target is checked again before dialing, and active dials are canceled during shutdown. Active FTP clients behind NAT must advertise the IP visible to the server or use passive mode.
+- Passive data connections must also originate from the control peer's IP. Shutdown closes control/data sockets and passive listeners and waits for all connection handlers.
+- The configured home directory is trusted when opened at login. `os.Root` is not an OS sandbox: it does not exclude existing hard links, mount points, or device files inside the tree. `GOOS=js` deployments do not provide the same symlink-race guarantee. See [Go's `os.Root` documentation](https://pkg.go.dev/os#Root).
 - Configuration validation ensures home directories exist before starting.
 
 ## License

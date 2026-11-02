@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,11 +13,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // FTPConn represents an FTP client connection
 type FTPConn struct {
+	// mu protects resources shared by the command loop and server shutdown.
+	mu             sync.Mutex
+	closed         bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	root           *os.Root
 	conn           net.Conn
 	username       string
 	running        bool
@@ -34,7 +42,10 @@ type FTPConn struct {
 
 // NewFTPConn creates a new FTP connection handler
 func NewFTPConn(conn net.Conn, config Config) *FTPConn {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FTPConn{
+		ctx:        ctx,
+		cancel:     cancel,
 		conn:       conn,
 		config:     config,
 		running:    true,
@@ -45,21 +56,90 @@ func NewFTPConn(conn net.Conn, config Config) *FTPConn {
 
 // Close closes the FTP connection
 func (c *FTPConn) Close() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	if c.cancel != nil {
+		c.cancel()
+	}
+	data, listener, root := c.dataConn, c.listener, c.root
+	c.dataConn, c.listener, c.root = nil, nil, nil
+	c.mu.Unlock()
 	if c.conn != nil {
 		c.conn.Close()
 	}
-	c.closeDataConn()
-	if c.listener != nil {
-		c.listener.Close()
+	if listener != nil {
+		listener.Close()
 	}
+	if data != nil {
+		data.Close()
+	}
+	if root != nil {
+		root.Close()
+	}
+}
+
+// filesystem returns the login's pinned root, never an absolute client path.
+func (c *FTPConn) filesystem() (*os.Root, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.root == nil {
+		return nil, errors.New("filesystem unavailable")
+	}
+	return c.root, nil
+}
+
+func (c *FTPConn) resetLogin() {
+	c.identified = false
+	c.username, c.homeDir, c.currDir, c.renameTempPath = "", "", "/", ""
+	c.mu.Lock()
+	root, listener, data := c.root, c.listener, c.dataConn
+	c.root, c.listener, c.dataConn = nil, nil, nil
+	c.pasv, c.dataHost, c.dataPort = false, "", 0
+	c.mu.Unlock()
+	if root != nil {
+		root.Close()
+	}
+	if listener != nil {
+		listener.Close()
+	}
+	if data != nil {
+		data.Close()
+	}
+}
+
+func (c *FTPConn) login(home string) error {
+	root, err := os.OpenRoot(home)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		root.Close()
+		return net.ErrClosed
+	}
+	old := c.root
+	c.root = root
+	c.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	c.homeDir, c.currDir, c.renameTempPath = home, "/", ""
+	c.identified = true
+	return nil
 }
 
 // Handle handles the FTP connection
 func (c *FTPConn) Handle() {
+	defer c.Close()
 	c.sendWelcome()
 
 	scanner := bufio.NewScanner(c.conn)
-	for scanner.Scan() && c.running {
+	for c.running && scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
@@ -78,7 +158,6 @@ func (c *FTPConn) Handle() {
 	}
 
 	c.sendMsg(221, "Goodbye")
-	c.Close()
 	log.Printf("Connection closed for user %s", c.username)
 }
 
@@ -92,45 +171,25 @@ func (c *FTPConn) parseCommand(line string) (string, string) {
 	return cmd, arg
 }
 
-// parsePath converts a remote path to a local path with security checks
-// Returns error if path escapes the home directory
+// parsePath maps slash-separated FTP names to paths relative to os.Root.
+// Virtual /.. stays at /; native separators, drive/stream syntax and NUL are rejected.
+// This normalization is not the security boundary: every file operation uses Root.
 func (c *FTPConn) parsePath(remotePath string) (remote, local string, err error) {
-	if remotePath == "" {
-		remotePath = "."
+	if strings.ContainsAny(remotePath, "\\:\x00") {
+		return "", "", errors.New("invalid FTP path")
 	}
-
-	// Handle relative vs absolute paths
-	if !strings.HasPrefix(remotePath, "/") {
-		remotePath = path.Join(c.currDir, remotePath)
+	if !path.IsAbs(remotePath) {
+		remotePath = path.Join("/", c.currDir, remotePath)
 	}
-
-	// Clean the path
-	remotePath = path.Clean(remotePath)
-
-	// Construct local path
-	localPath := filepath.Join(c.homeDir, remotePath)
-
-	// Security check: ensure path is within homeDir
-	absHome, err := filepath.Abs(c.homeDir)
+	remote = path.Clean(remotePath)
+	if remote == "/" {
+		return remote, ".", nil
+	}
+	local, err = filepath.Localize(strings.TrimPrefix(remote, "/"))
 	if err != nil {
-		return "", "", fmt.Errorf("failed to resolve home directory: %w", err)
+		return "", "", fmt.Errorf("invalid FTP path: %w", err)
 	}
-
-	absLocal, err := filepath.Abs(localPath)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to resolve path: %w", err)
-	}
-
-	// Check for path traversal attempt
-	if !strings.HasPrefix(absLocal, absHome) {
-		return "", "", errors.New("access denied: path traversal attempt")
-	}
-
-	if remotePath == "." {
-		remotePath = "/"
-	}
-
-	return remotePath, absLocal, nil
+	return remote, local, nil
 }
 
 func (c *FTPConn) sendWelcome() {
@@ -145,39 +204,84 @@ func (c *FTPConn) sendMsg(code int, msg string) {
 	}
 }
 
-func (c *FTPConn) establishDataConn() error {
-	c.closeDataConn()
-
-	var conn net.Conn
-	var err error
-
-	if c.pasv {
-		conn, err = c.listener.Accept()
-		if err != nil {
-			return fmt.Errorf("passive mode accept failed: %w", err)
-		}
-	} else {
-		raddr := fmt.Sprintf("%s:%d", c.dataHost, c.dataPort)
-		conn, err = net.Dial("tcp", raddr)
-		if err != nil {
-			return fmt.Errorf("active mode dial failed: %w", err)
-		}
+// validateActiveTarget is checked both at PORT and immediately before dialing.
+func (c *FTPConn) validateActiveTarget(host string, port int) error {
+	peer, ok := c.conn.RemoteAddr().(*net.TCPAddr)
+	ip := net.ParseIP(host)
+	if !ok || ip == nil || !ip.Equal(peer.IP) {
+		return errors.New("data target must match control peer")
 	}
-
-	c.dataConn = conn
+	if port < 1024 || port > 65535 {
+		return errors.New("data port must be between 1024 and 65535")
+	}
 	return nil
 }
 
+func (c *FTPConn) establishDataConn() (net.Conn, error) {
+	c.closeDataConn()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	passive, listener, host, port, ctx := c.pasv, c.listener, c.dataHost, c.dataPort, c.ctx
+	c.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var conn net.Conn
+	var err error
+	if passive {
+		if listener == nil {
+			return nil, errors.New("PASV required first")
+		}
+		for {
+			conn, err = listener.Accept()
+			if err != nil {
+				return nil, fmt.Errorf("passive mode accept failed: %w", err)
+			}
+			peer, peerOK := c.conn.RemoteAddr().(*net.TCPAddr)
+			dataPeer, dataOK := conn.RemoteAddr().(*net.TCPAddr)
+			if peerOK && dataOK && peer.IP.Equal(dataPeer.IP) {
+				break
+			}
+			conn.Close()
+		}
+	} else {
+		if err := c.validateActiveTarget(host, port); err != nil {
+			return nil, err
+		}
+		dialer := net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			return nil, fmt.Errorf("active mode dial failed: %w", err)
+		}
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		conn.Close()
+		return nil, net.ErrClosed
+	}
+	c.dataConn = conn
+	c.mu.Unlock()
+	return conn, nil
+}
+
 func (c *FTPConn) closeDataConn() {
-	if c.dataConn != nil {
-		c.dataConn.Close()
-		c.dataConn = nil
+	c.mu.Lock()
+	conn := c.dataConn
+	c.dataConn = nil
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
 	}
 }
 
 // Command handlers
 
 func (c *FTPConn) handleUSER(arg string) {
+	c.resetLogin()
 	userConfig, ok := c.config[arg]
 	if !ok {
 		c.sendMsg(550, "Invalid user")
@@ -187,8 +291,10 @@ func (c *FTPConn) handleUSER(arg string) {
 
 	c.username = arg
 	if arg == "anonymous" {
-		c.identified = true
-		c.homeDir = userConfig.HomeDir
+		if err := c.login(userConfig.HomeDir); err != nil {
+			c.sendMsg(530, "Home directory unavailable")
+			return
+		}
 		c.sendMsg(230, "Login successful")
 	} else {
 		c.sendMsg(331, "Password required")
@@ -214,8 +320,10 @@ func (c *FTPConn) handlePASS(arg string) {
 		return
 	}
 
-	c.homeDir = userConfig.HomeDir
-	c.identified = true
+	if err := c.login(userConfig.HomeDir); err != nil {
+		c.sendMsg(530, "Home directory unavailable")
+		return
+	}
 	c.sendMsg(230, "Login successful")
 }
 
@@ -225,13 +333,19 @@ func (c *FTPConn) handleCWD(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	remote, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Failed to change directory: %v", err))
 		return
 	}
 
-	info, err := os.Stat(local)
+	info, err := root.Stat(local)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Directory not found: %v", err))
 		return
@@ -264,7 +378,13 @@ func (c *FTPConn) handleLIST(arg string) {
 		return
 	}
 
-	if err := c.establishDataConn(); err != nil {
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+	data, err := c.establishDataConn()
+	if err != nil {
 		c.sendMsg(425, fmt.Sprintf("Cannot open data connection: %v", err))
 		return
 	}
@@ -276,8 +396,13 @@ func (c *FTPConn) handleLIST(arg string) {
 		return
 	}
 
-	// Use os.ReadDir (replaces deprecated ioutil.ReadDir)
-	entries, err := os.ReadDir(local)
+	dir, err := root.Open(local)
+	if err != nil {
+		c.sendMsg(550, "Cannot open directory")
+		return
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Failed to read directory: %v", err))
 		return
@@ -286,12 +411,15 @@ func (c *FTPConn) handleLIST(arg string) {
 	c.sendMsg(125, "Data connection already open; transfer starting")
 
 	for _, entry := range entries {
-		info, err := entry.Info()
+		info, err := root.Lstat(filepath.Join(local, entry.Name()))
 		if err != nil {
 			continue
 		}
 		line := c.formatListLine(entry.Name(), info)
-		io.WriteString(c.dataConn, line)
+		if _, err := io.WriteString(data, line); err != nil {
+			c.sendMsg(451, "Transfer failed")
+			return
+		}
 	}
 
 	c.sendMsg(226, "Transfer complete")
@@ -322,19 +450,26 @@ func (c *FTPConn) handleRETR(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	_, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
 		return
 	}
 
-	if err := c.establishDataConn(); err != nil {
+	data, err := c.establishDataConn()
+	if err != nil {
 		c.sendMsg(425, fmt.Sprintf("Cannot open data connection: %v", err))
 		return
 	}
 	defer c.closeDataConn()
 
-	file, err := os.Open(local)
+	file, err := root.Open(local)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Cannot open file: %v", err))
 		return
@@ -343,7 +478,7 @@ func (c *FTPConn) handleRETR(arg string) {
 
 	c.sendMsg(125, "Data connection already open; transfer starting")
 
-	_, err = io.Copy(c.dataConn, file)
+	_, err = io.Copy(data, file)
 	if err != nil {
 		c.sendMsg(451, "Transfer failed")
 		return
@@ -358,19 +493,26 @@ func (c *FTPConn) handleSTOR(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	_, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
 		return
 	}
 
-	if err := c.establishDataConn(); err != nil {
+	data, err := c.establishDataConn()
+	if err != nil {
 		c.sendMsg(425, fmt.Sprintf("Cannot open data connection: %v", err))
 		return
 	}
 	defer c.closeDataConn()
 
-	file, err := os.Create(local)
+	file, err := root.Create(local)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Cannot create file: %v", err))
 		return
@@ -379,7 +521,7 @@ func (c *FTPConn) handleSTOR(arg string) {
 
 	c.sendMsg(125, "Data connection already open; transfer starting")
 
-	_, err = io.Copy(file, c.dataConn)
+	_, err = io.Copy(file, data)
 	if err != nil {
 		c.sendMsg(451, "Transfer failed")
 		return
@@ -394,13 +536,19 @@ func (c *FTPConn) handleMKD(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	remote, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
 		return
 	}
 
-	if err := os.MkdirAll(local, 0755); err != nil {
+	if err := root.MkdirAll(local, 0755); err != nil {
 		c.sendMsg(550, fmt.Sprintf("Cannot create directory: %v", err))
 		return
 	}
@@ -414,13 +562,19 @@ func (c *FTPConn) handleRMD(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	_, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
 		return
 	}
 
-	if err := os.Remove(local); err != nil {
+	if err := root.Remove(local); err != nil {
 		c.sendMsg(550, fmt.Sprintf("Cannot remove directory: %v", err))
 		return
 	}
@@ -434,13 +588,19 @@ func (c *FTPConn) handleDELE(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	_, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
 		return
 	}
 
-	if err := os.Remove(local); err != nil {
+	if err := root.Remove(local); err != nil {
 		c.sendMsg(550, fmt.Sprintf("Cannot delete file: %v", err))
 		return
 	}
@@ -454,9 +614,20 @@ func (c *FTPConn) handleRNFR(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	remote, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
+		return
+	}
+
+	if _, err := root.Lstat(local); err != nil {
+		c.sendMsg(550, "Rename source unavailable")
 		return
 	}
 
@@ -475,13 +646,21 @@ func (c *FTPConn) handleRNTO(arg string) {
 		return
 	}
 
+	root, err := c.filesystem()
+	if err != nil {
+		c.sendMsg(550, "Filesystem unavailable")
+		return
+	}
+
 	remote, local, err := c.parsePath(arg)
 	if err != nil {
 		c.sendMsg(550, fmt.Sprintf("Access denied: %v", err))
 		return
 	}
 
-	if err := os.Rename(c.renameTempPath, local); err != nil {
+	source := c.renameTempPath
+	c.renameTempPath = ""
+	if err := root.Rename(source, local); err != nil {
 		c.sendMsg(550, fmt.Sprintf("Cannot rename: %v", err))
 		return
 	}
@@ -501,23 +680,43 @@ func (c *FTPConn) handlePORT(arg string) {
 		c.sendMsg(501, "Invalid PORT parameter")
 		return
 	}
-
-	c.dataHost = strings.Join(params[0:4], ".")
-
-	p1, err := strconv.Atoi(params[4])
-	if err != nil {
-		c.sendMsg(501, "Invalid port parameter")
+	var octets [6]byte
+	for i, field := range params {
+		if field == "" {
+			c.sendMsg(501, "Invalid PORT parameter")
+			return
+		}
+		for _, ch := range field {
+			if ch < '0' || ch > '9' {
+				c.sendMsg(501, "Invalid PORT parameter")
+				return
+			}
+		}
+		value, err := strconv.ParseUint(field, 10, 8)
+		if err != nil {
+			c.sendMsg(501, "Invalid PORT parameter")
+			return
+		}
+		octets[i] = byte(value)
+	}
+	host := net.IPv4(octets[0], octets[1], octets[2], octets[3]).String()
+	port := int(octets[4])*256 + int(octets[5])
+	if err := c.validateActiveTarget(host, port); err != nil {
+		c.sendMsg(501, err.Error())
 		return
 	}
-
-	p2, err := strconv.Atoi(params[5])
-	if err != nil {
-		c.sendMsg(501, "Invalid port parameter")
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
 		return
 	}
-
-	c.dataPort = p1*256 + p2
-	c.pasv = false
+	oldListener := c.listener
+	c.listener = nil
+	c.dataHost, c.dataPort, c.pasv = host, port, false
+	c.mu.Unlock()
+	if oldListener != nil {
+		oldListener.Close()
+	}
 	c.sendMsg(200, "PORT command successful")
 }
 
@@ -527,29 +726,38 @@ func (c *FTPConn) handlePASV(arg string) {
 		return
 	}
 
-	if c.listener != nil {
-		c.listener.Close()
+	// Advertise the control connection's local IPv4 address when available.
+	var ip string
+	if addr, ok := c.conn.LocalAddr().(*net.TCPAddr); ok && addr.IP.To4() != nil {
+		ip = addr.IP.To4().String()
+	} else {
+		var err error
+		ip, err = getExternalIP()
+		if err != nil {
+			c.sendMsg(421, "Cannot get local IPv4 address")
+			return
+		}
 	}
-
-	ip, err := getExternalIP()
-	if err != nil {
-		c.sendMsg(421, fmt.Sprintf("Cannot get external IP: %v", err))
-		return
-	}
-
-	laddr := fmt.Sprintf("%s:0", ip)
-	listener, err := net.Listen("tcp", laddr)
+	listener, err := net.Listen("tcp4", net.JoinHostPort(ip, "0"))
 	if err != nil {
 		c.sendMsg(421, fmt.Sprintf("Cannot create passive listener: %v", err))
 		return
 	}
-
-	c.listener = listener
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		listener.Close()
+		return
+	}
+	oldListener := c.listener
+	c.listener, c.pasv = listener, true
+	c.mu.Unlock()
+	if oldListener != nil {
+		oldListener.Close()
+	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	ipStr := strings.ReplaceAll(ip, ".", ",")
-
 	c.sendMsg(227, fmt.Sprintf("Entering Passive Mode (%s,%d,%d)", ipStr, port>>8&0xFF, port&0xFF))
-	c.pasv = true
 }
 
 func (c *FTPConn) handleTYPE(arg string) {

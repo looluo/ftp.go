@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// Server represents an FTP server
+// Server represents an FTP server.
 type Server struct {
 	port     int
 	listener net.Listener
@@ -17,68 +17,69 @@ type Server struct {
 	conns    map[*FTPConn]struct{}
 }
 
-// NewServer creates a new FTP server
+// NewServer creates a new FTP server.
 func NewServer(port int, config Config) (*Server, error) {
-	return &Server{
-		port:   port,
-		config: config,
-		conns:  make(map[*FTPConn]struct{}),
-	}, nil
+	return &Server{port: port, config: config, conns: make(map[*FTPConn]struct{})}, nil
 }
 
-// Start starts the FTP server
+// Start serves until cancellation, then waits for every connection handler.
 func (s *Server) Start(ctx context.Context) error {
-	laddr := fmt.Sprintf(":%d", s.port)
-	listener, err := net.Listen("tcp", laddr)
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
-	s.listener = listener
-	defer listener.Close()
-
-	log.Printf("FTP server listening on %s", laddr)
-
-	// Accept connections in a goroutine
-	connChan := make(chan net.Conn)
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					log.Printf("Accept error: %v", err)
-					continue
-				}
-			}
-			connChan <- conn
-		}
-	}()
-
-	// Handle connections
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Shutting down server...")
-			s.closeAllConnections()
-			return nil
-		case conn := <-connChan:
-			log.Printf("New connection from %s", conn.RemoteAddr())
-			ftpConn := NewFTPConn(conn, s.config)
-			s.trackConnection(ftpConn)
-			go func() {
-				defer s.untrackConnection(ftpConn)
-				ftpConn.Handle()
-			}()
-		}
-	}
+	return s.serve(ctx, listener)
 }
 
-func (s *Server) trackConnection(conn *FTPConn) {
+func (s *Server) serve(parent context.Context, listener net.Listener) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	s.mu.Lock()
-	s.conns[conn] = struct{}{}
+	s.listener = listener
 	s.mu.Unlock()
+	log.Printf("FTP server listening on %s", listener.Addr())
+
+	// Closing the listener unblocks Accept; closing connections unblocks commands,
+	// passive Accept, active DialContext, and in-progress transfers.
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		listener.Close()
+		s.closeAllConnections()
+	}()
+
+	var handlers sync.WaitGroup
+	var acceptErr error
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			acceptErr = err
+			break
+		}
+		s.mu.Lock()
+		if ctx.Err() != nil {
+			s.mu.Unlock()
+			conn.Close()
+			break
+		}
+		ftpConn := NewFTPConn(conn, s.config)
+		s.conns[ftpConn] = struct{}{}
+		handlers.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer handlers.Done()
+			defer s.untrackConnection(ftpConn)
+			ftpConn.Handle()
+		}()
+	}
+	cancel()
+	<-shutdownDone
+	handlers.Wait()
+	if parent.Err() != nil {
+		return nil
+	}
+	return fmt.Errorf("accept failed: %w", acceptErr)
 }
 
 func (s *Server) untrackConnection(conn *FTPConn) {
@@ -89,8 +90,12 @@ func (s *Server) untrackConnection(conn *FTPConn) {
 
 func (s *Server) closeAllConnections() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	conns := make([]*FTPConn, 0, len(s.conns))
 	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.mu.Unlock()
+	for _, conn := range conns {
 		conn.Close()
 	}
 }
